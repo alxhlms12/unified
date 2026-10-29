@@ -57,6 +57,39 @@ export async function search(env, query, type = "track", limit = 25, offset = 0)
     })).filter(Boolean) : collection };
 }
 
+// SoundCloud does not expose a dedicated ISRC filter on its track-search
+// endpoint. Try its text index with the ISRC, then verify any candidates against
+// full track metadata. A zero-result response is not proof the ISRC is absent
+// from the entire SoundCloud catalog; this limitation is returned to callers.
+export async function findByIsrc(env, isrc, limit = 50) {
+  const response = await request(env, "search/tracks", {
+    q: isrc, limit: Math.min(limit, 50), offset: 0,
+    linked_partitioning: "true", access: "playable,preview"
+  });
+  const candidates = response.collection ?? [];
+  const checked = await Promise.all(candidates.slice(0, 20).map(async item => {
+    let full = item;
+    if (!item.publisher_metadata?.isrc && !item.publisher_metadata?.ISRC && item.id != null) {
+      try { full = await info(env, item.id); } catch { /* keep search metadata for the exact comparison */ }
+    }
+    return normalizeTrack("soundcloud", {
+      ...item, ...full,
+      id: full.id ?? full.urn ?? item.id ?? item.urn,
+      title: full.title ?? item.title,
+      artists: [{ id: (full.user ?? item.user)?.id, name: (full.user ?? item.user)?.username }],
+      durationMs: full.duration ?? item.duration,
+      artworkUrl: full.artwork_url ?? item.artwork_url,
+      url: full.permalink_url ?? item.permalink_url,
+      isrc: full.isrc ?? full.publisher_metadata?.isrc ?? full.publisher_metadata?.ISRC ?? item.publisher_metadata?.isrc ?? null
+    });
+  }));
+  return {
+    items: checked.filter(Boolean),
+    strategy: "text_search_then_metadata_verification",
+    limitation: "SoundCloud does not provide a dedicated ISRC search filter; only candidates surfaced by text search can be verified."
+  };
+}
+
 export async function info(env, id) { return request(env, `tracks/${encodeURIComponent(id)}`); }
 export async function album(env, id) { return request(env, `playlists/${encodeURIComponent(id)}`); }
 export async function artist(env, id) { return request(env, `users/${encodeURIComponent(id)}`); }

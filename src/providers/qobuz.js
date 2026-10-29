@@ -15,7 +15,7 @@ async function request(env, path, params = {}) {
     headers: {
       "x-app-id": env["q-cid"],
       "x-user-auth-token": env["q-uat"],
-      "user-agent": "UnifiedMusicAPI/0.2.0",
+      "user-agent": "UnifiedMusicAPI/0.2.1",
       accept: "application/json"
     }
   });

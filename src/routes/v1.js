@@ -29,7 +29,11 @@ function normalizeEntity(provider, type, input) {
   if (type === "track") return normalizeTrack(provider, data) ?? data;
   const rawId = data.id ?? data.browseId ?? data.playlistId ?? data.artistId;
   const image = data.artworkUrl ?? data.coverUrl ?? data.image ?? data.picture?.urls?.[0]?.url ??
-    data.picture?.url ?? data.picture ?? data.cover?.urls?.[0]?.url ?? null;
+    data.picture?.url ?? data.picture ?? data.cover?.urls?.[0]?.url ?? data.cover ?? null;
+  const artworkUrl = typeof image === "string"
+    ? (provider === "tidal" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(image)
+      ? `https://resources.tidal.com/images/${image.replace(/-/g, "/")}/750x750.jpg` : image)
+    : image?.url ?? null;
   const title = data.title ?? data.displayTitle ?? data.name ?? null;
   const artists = data.artists ?? data.contributors?.edges?.map(edge => edge.node) ?? [];
   const entity = {
@@ -38,7 +42,7 @@ function normalizeEntity(provider, type, input) {
     title,
     ...(type === "artist" ? { name: data.name ?? title } : {}),
     description: data.description ?? data.bio ?? null,
-    artworkUrl: typeof image === "string" ? image : image?.url ?? null,
+    artworkUrl,
     artists: (Array.isArray(artists) ? artists : [artists]).map(artist => ({
       id: artist?.id == null ? null : `${provider}:artist:${artist.id}`,
       name: artist?.name ?? "Unknown artist"
@@ -48,17 +52,25 @@ function normalizeEntity(provider, type, input) {
   };
   if (type === "album") {
     entity.releaseDate = data.releaseDate ?? data.releasedAt ?? null;
-    entity.trackCount = data.numberOfItems ?? data.tracksCount ?? data.tracks?.edges?.length ?? null;
-    entity.tracks = data.tracks?.edges?.map(edge => normalizeTrack(provider, edge.node)).filter(Boolean) ?? null;
+    const rawTracks = data.tracks?.edges?.map(edge => edge.node) ?? data.items ?? data.tracks?.items ?? null;
+    entity.trackCount = data.numberOfItems ?? data.numberOfTracks ?? data.tracksCount ?? rawTracks?.length ?? null;
+    entity.tracks = Array.isArray(rawTracks)
+      ? rawTracks.map(item => normalizeTrack(provider, item?.item ?? item)).filter(Boolean)
+      : null;
+    if (data.itemsError) entity.tracksError = data.itemsError;
   }
   if (type === "artist") {
     entity.albums = data.albums?.edges?.map(edge => normalizeEntity(provider, "album", edge.node)) ?? null;
     entity.topTracks = data.topTracks?.edges?.map(edge => normalizeTrack(provider, edge.node)).filter(Boolean) ?? null;
   }
   if (type === "playlist") {
-    entity.trackCount = data.estimatedTracksCount ?? data.numberOfTracks ?? data.tracks?.edges?.length ?? null;
-    entity.tracks = data.tracks?.edges?.map(edge => normalizeTrack(provider, edge.node)).filter(Boolean) ?? null;
+    const rawTracks = data.tracks?.edges?.map(edge => edge.node) ?? data.items ?? data.tracks?.items ?? null;
+    entity.trackCount = data.estimatedTracksCount ?? data.numberOfTracks ?? rawTracks?.length ?? null;
+    entity.tracks = Array.isArray(rawTracks)
+      ? rawTracks.map(item => normalizeTrack(provider, item?.item ?? item)).filter(Boolean)
+      : null;
     entity.owner = data.owner?.name ?? null;
+    if (data.itemsError) entity.tracksError = data.itemsError;
   }
   return entity;
 }
@@ -101,23 +113,44 @@ async function runSearch(env, url) {
 }
 
 async function matchIsrc(env, url) {
-  const isrc = requireParam(url, "isrc").trim().toUpperCase();
+  const isrc = requireParam(url, "isrc").replace(/[\s-]/g, "").toUpperCase();
+  if (!/^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/.test(isrc)) {
+    throw new ApiError(400, "invalid_isrc", "isrc must be a 12-character ISO 3901 recording code.");
+  }
   const targets = Object.keys(providers);
-  const settled = await Promise.allSettled(targets.map(name => providers[name].search(env, isrc, "track", 10, 0)));
+  const settled = await Promise.allSettled(targets.map(async name => {
+    const adapter = providers[name];
+    if (typeof adapter.findByIsrc === "function") return await adapter.findByIsrc(env, isrc, 25, 0);
+    const result = await adapter.search(env, isrc, "track", 25, 0);
+    return { items: result?.items ?? [], strategy: "text_search_then_exact_isrc_check" };
+  }));
   const matches = [];
   const errors = [];
+  const checkedProviders = [];
   settled.forEach((entry, index) => {
     const provider = targets[index];
     if (entry.status === "rejected") {
-      errors.push({ provider, code: entry.reason?.code || "provider_error", message: entry.reason?.message || "Provider request failed." });
+      const error = { provider, code: entry.reason?.code || "provider_error", message: entry.reason?.message || "Provider request failed." };
+      errors.push(error);
+      checkedProviders.push({ provider, checked: false, candidateCount: 0, matchCount: 0, error: error.code });
       return;
     }
-    for (const item of entry.value?.items ?? []) {
+    const items = Array.isArray(entry.value?.items) ? entry.value.items : [];
+    let matchCount = 0;
+    for (const item of items) {
       const normalized = normalizeEntity(provider, "track", item);
-      if (normalized?.isrc && normalized.isrc.toUpperCase() === isrc) matches.push(normalized);
+      if (normalized?.isrc && String(normalized.isrc).toUpperCase() === isrc) {
+        matches.push(normalized);
+        matchCount++;
+      }
     }
+    checkedProviders.push({
+      provider, checked: true, strategy: entry.value?.strategy || "text_search_then_exact_isrc_check",
+      candidateCount: items.length, matchCount,
+      ...(entry.value?.limitation ? { limitation: entry.value.limitation } : {})
+    });
   });
-  return { isrc, matches, errors, partial: errors.length > 0 };
+  return { isrc, matches, checkedProviders, errors, partial: errors.length > 0 };
 }
 
 function parseProviderUrl(value) {

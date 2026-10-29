@@ -5,6 +5,32 @@ const AUTH_URL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const GRAPHQL_URL = "https://pipe.deezer.com/api";
 const jwtCache = new Map();
 
+function splitSetCookie(headers) {
+  if (typeof headers?.getSetCookie === "function") return headers.getSetCookie();
+  const combined = headers?.get?.("set-cookie");
+  return combined ? combined.split(/,(?=\s*[^;,\s]+=)/g) : [];
+}
+
+function rememberCookies(arl, headers) {
+  const cache = jwtCache.get(arl) ?? {};
+  const jar = new Map();
+  for (const part of String(cache.cookies ?? "").split(";")) {
+    const separator = part.indexOf("=");
+    if (separator > 0) jar.set(part.slice(0, separator).trim(), part.slice(separator + 1).trim());
+  }
+  for (const setCookie of splitSetCookie(headers)) {
+    const pair = String(setCookie).split(";", 1)[0];
+    const separator = pair.indexOf("=");
+    if (separator <= 0) continue;
+    const name = pair.slice(0, separator).trim();
+    const value = pair.slice(separator + 1).trim();
+    if (name.toLowerCase() === "arl") continue;
+    if (value) jar.set(name, value);
+    else jar.delete(name);
+  }
+  jwtCache.set(arl, { ...cache, cookies: [...jar].map(([name, value]) => `${name}=${value}`).join("; ") });
+}
+
 function assertConfigured(env) {
   if (!env["d-arl"] || !String(env["d-arl"]).trim()) {
     throw new ApiError(503, "provider_not_configured", "Deezer is not configured on this Unified instance.", { missing: REQUIRED });
@@ -16,7 +42,10 @@ async function getJwt(env, force = false) {
   const arl = env["d-arl"];
   const current = jwtCache.get(arl);
   if (!force && current?.token && current.expiresAt > Date.now() + 30000) return current.token;
-  const { text } = await fetchText(AUTH_URL, {
+  const { response: authResponse, text } = await fetchText(AUTH_URL, {
+    // Deezer's ARL->JWT handshake is a POST. Sending GET here is rejected
+    // with HTTP 405 before Pipe GraphQL is ever reached.
+    method: "POST",
     headers: {
       cookie: `arl=${arl}`,
       origin: "https://www.deezer.com",
@@ -25,28 +54,36 @@ async function getJwt(env, force = false) {
       accept: "application/json, text/plain, */*"
     }
   });
+  rememberCookies(arl, authResponse.headers);
   let body;
   try { body = JSON.parse(text); } catch { throw new ApiError(503, "deezer_auth_failed", "Deezer returned an invalid authentication response."); }
   const token = body.jwt ?? body.token ?? body.access_token;
   if (typeof token !== "string" || !token) throw new ApiError(503, "deezer_auth_failed", "Deezer did not return a JWT. Check d-arl.");
   const expiresAt = parseJwtExpiry(token) || Date.now() + 330000;
-  jwtCache.set(arl, { token, expiresAt });
+  jwtCache.set(arl, { ...(jwtCache.get(arl) ?? {}), token, expiresAt });
   return token;
 }
 
 async function gql(env, query, variables = {}) {
   let jwt = await getJwt(env);
-  const send = async token => fetchJson(GRAPHQL_URL, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-      origin: "https://www.deezer.com",
-      referer: "https://www.deezer.com/",
-      "user-agent": "Mozilla/5.0"
-    },
-    body: JSON.stringify({ query, variables })
-  });
+  const send = async token => {
+    const cookies = jwtCache.get(env["d-arl"])?.cookies;
+    const { response, text } = await fetchText(GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        origin: "https://www.deezer.com",
+        referer: "https://www.deezer.com/",
+        "user-agent": "Mozilla/5.0",
+        ...(cookies ? { cookie: cookies } : {})
+      },
+      body: JSON.stringify({ query, variables })
+    });
+    rememberCookies(env["d-arl"], response.headers);
+    try { return text ? JSON.parse(text) : {}; }
+    catch { throw new ApiError(502, "invalid_upstream_json", "Deezer Pipe returned a non-JSON response."); }
+  };
   let result;
   try { result = await send(jwt); }
   catch (error) {

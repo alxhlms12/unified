@@ -1,4 +1,4 @@
-export const API_VERSION = "0.2.0";
+export const API_VERSION = "0.2.1";
 export const TIDAL_COMPAT_VERSION = "2.10";
 
 export class ApiError extends Error {
@@ -122,20 +122,33 @@ export function normalizeTrack(provider, track) {
   if (typeof track.id === "string" && track.id.startsWith(`${provider}:track:`) && track.type === "track") return track;
   const rawId = track.id ?? track.trackId ?? track.videoId ?? track.urn;
   if (rawId == null) return null;
-  const artistSource = track.artists ?? track.contributors?.edges?.map(edge => edge.node) ?? (track.artist ? [track.artist] : []);
+  const artistSource = track.artists ?? track.contributors?.edges?.map(edge => edge.node) ??
+    (track.artist ? [track.artist] : track.user ? [track.user] : []);
   const artists = (Array.isArray(artistSource) ? artistSource : [artistSource]).map(artist => ({
     id: artist?.id != null ? `${provider}:artist:${artist.id}` : null,
     name: artist?.name ?? artist?.username ?? "Unknown artist"
   }));
   const albumRaw = track.album;
+  const albumCover = albumRaw?.coverUrl ?? albumRaw?.image ?? albumRaw?.artworkUrl ??
+    firstUrl(albumRaw?.cover?.urls) ?? (typeof albumRaw?.cover === "string" ? albumRaw.cover : null) ?? null;
+  const albumArtwork = typeof albumCover === "string" && provider === "tidal" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(albumCover)
+    ? `https://resources.tidal.com/images/${albumCover.replace(/-/g, "/")}/750x750.jpg`
+    : albumCover;
   const album = albumRaw ? {
     id: albumRaw.id != null ? `${provider}:album:${albumRaw.id}` : null,
     title: albumRaw.title ?? albumRaw.displayTitle ?? albumRaw.name ?? null,
-    artworkUrl: albumRaw.coverUrl ?? albumRaw.image ?? albumRaw.artworkUrl ?? firstUrl(albumRaw.cover?.urls) ?? null
+    artworkUrl: albumArtwork
   } : null;
   const durationRaw = track.durationMs ?? track.duration ?? null;
-  const durationMs = durationRaw == null ? null : (track.durationMs != null ? durationRaw : durationRaw * 1000);
-  const artworkUrl = track.artworkUrl ?? track.artwork_url ?? track.image ?? firstUrl(albumRaw?.cover?.urls) ?? null;
+  // Tidal/Deezer/Qobuz durations are seconds; SoundCloud's track object uses ms.
+  const durationMs = durationRaw == null ? null : (track.durationMs != null || provider === "soundcloud" ? durationRaw : durationRaw * 1000);
+  const rawArtwork = track.artworkUrl ?? track.artwork_url ?? track.image ?? firstUrl(albumRaw?.cover?.urls) ??
+    (typeof albumRaw?.cover === "string" ? albumRaw.cover : null) ?? null;
+  const artworkUrl = typeof rawArtwork === "string" && provider === "tidal" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawArtwork)
+    ? `https://resources.tidal.com/images/${rawArtwork.replace(/-/g, "/")}/750x750.jpg`
+    : rawArtwork;
   return {
     id: `${provider}:track:${rawId}`,
     type: "track",
@@ -143,7 +156,7 @@ export function normalizeTrack(provider, track) {
     artists,
     album,
     durationMs,
-    isrc: track.isrc ?? track.ISRC ?? null,
+    isrc: track.isrc ?? track.ISRC ?? track.publisher_metadata?.isrc ?? track.publisher_metadata?.ISRC ?? null,
     explicit: track.explicit ?? track.isExplicit ?? null,
     artworkUrl,
     url: track.url ?? track.permalink_url ?? null,

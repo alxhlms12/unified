@@ -83,6 +83,14 @@ export async function search(env, q, type = "track", limit = 25, offset = 0) {
   return data;
 }
 
+// Tidal exposes a native ISRC filter on GET /v1/tracks. Use it instead of
+// submitting the ISRC as ordinary search text (which does not reliably match).
+export async function findByIsrc(env, isrc, limit = 25, offset = 0) {
+  const result = await api(env, "tracks", { isrc, limit, offset, countryCode: env["t-cc"] || "US" });
+  const items = Array.isArray(result?.items) ? result.items : Array.isArray(result?.data?.items) ? result.data.items : [];
+  return { items, strategy: "native_isrc_filter", total: result?.totalNumberOfItems ?? result?.total ?? items.length };
+}
+
 export async function compatible(env, path, url) {
   const q = url.searchParams;
   const id = q.get("id");
@@ -262,9 +270,39 @@ function intQuery(raw, fallback, min, max) {
 export async function unifiedSearch(env, query, type, limit, offset) {
   return search(env, query, type, limit, offset);
 }
-export async function info(env, id) { return api(env, `tracks/${id}`, {}); }
-export async function getAlbum(env, id) { return api(env, `albums/${id}`, {}); }
-export async function getArtist(env, id) { return api(env, `artists/${id}`, {}); }
-export async function getPlaylist(env, id) { return api(env, `playlists/${id}`, {}); }
-export async function getLyrics(env, id) { return api(env, `tracks/${id}/lyrics`, { locale: "en_US", deviceType: "BROWSER" }); }
-export async function getStream(env, id, quality = "HI_RES_LOSSLESS") { return api(env, `tracks/${id}/playbackinfo`, { audioquality: quality, playbackmode: "STREAM", assetpresentation: "FULL" }); }
+export async function info(env, id) { return api(env, `tracks/${encodeURIComponent(id)}`, {}); }
+export async function getAlbum(env, id) { return api(env, `albums/${encodeURIComponent(id)}`, {}); }
+export async function getArtist(env, id) { return api(env, `artists/${encodeURIComponent(id)}`, {}); }
+export async function getPlaylist(env, id) { return api(env, `playlists/${encodeURIComponent(id)}`, {}); }
+export async function getLyrics(env, id) { return api(env, `tracks/${encodeURIComponent(id)}/lyrics`, { locale: "en_US", deviceType: "BROWSER" }); }
+export async function getStream(env, id, quality = "HI_RES_LOSSLESS") { return api(env, `tracks/${encodeURIComponent(id)}/playbackinfo`, { audioquality: quality, playbackmode: "STREAM", assetpresentation: "FULL" }); }
+
+// Common adapter interface consumed by the generic /v1 REST router. Keep the
+// hifi-api-compatible route implementation above separate from these aliases.
+async function getItems(env, collection, id) {
+  const result = await api(env, `${collection}/${encodeURIComponent(id)}/items`, { limit: 100, offset: 0 });
+  const items = Array.isArray(result?.items) ? result.items : Array.isArray(result?.data?.items) ? result.data.items : [];
+  return items.map(entry => entry?.item ?? entry);
+}
+
+export async function album(env, id) {
+  const metadata = await getAlbum(env, id);
+  try {
+    const items = await getItems(env, "albums", id);
+    return { ...metadata, items };
+  } catch (error) {
+    return { ...metadata, items: null, itemsError: { code: error?.code || "track_listing_failed", message: error?.message || "Album tracks could not be loaded." } };
+  }
+}
+export async function artist(env, id) { return getArtist(env, id); }
+export async function playlist(env, id) {
+  const metadata = await getPlaylist(env, id);
+  try {
+    const items = await getItems(env, "playlists", id);
+    return { ...metadata, items };
+  } catch (error) {
+    return { ...metadata, items: null, itemsError: { code: error?.code || "track_listing_failed", message: error?.message || "Playlist tracks could not be loaded." } };
+  }
+}
+export async function lyrics(env, id) { return getLyrics(env, id); }
+export async function stream(env, id, quality) { return getStream(env, id, quality); }

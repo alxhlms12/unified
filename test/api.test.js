@@ -86,3 +86,29 @@ test("OPTIONS requests bypass provider authentication and receive CORS headers",
   assert.equal(response.status, 204);
   assert.equal(response.headers.get("access-control-allow-origin"), "*");
 });
+
+test("generic Tidal track metadata route calls the shared adapter interface", async t => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(input);
+    if (url.hostname === "auth.tidal.com") {
+      return new Response(JSON.stringify({ access_token: "test-access-token", expires_in: 3600 }), { status: 200 });
+    }
+    if (url.hostname === "api.tidal.com" && url.pathname === "/v1/tracks/123") {
+      return new Response(JSON.stringify({
+        id: 123, title: "Fixture", duration: 180, isrc: "USABC2612345",
+        artists: [{ id: 9, name: "Fixture Artist" }],
+        album: { id: 456, title: "Fixture Album", cover: "01234567-89ab-cdef-0123-456789abcdef" }
+      }), { status: 200 });
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+  t.after(() => { globalThis.fetch = realFetch; });
+  const credentials = { ...env, "t-cid": "route-test-client", "t-cs": "secret", "t-rt": "route-test-refresh", "t-cc": "US" };
+  const { response, body } = await get("/v1/tracks/tidal:track:123", {}, credentials);
+  assert.equal(response.status, 200);
+  assert.equal(body.data.id, "tidal:track:123");
+  assert.equal(body.data.title, "Fixture");
+  assert.equal(body.data.durationMs, 180000);
+  assert.equal(body.data.artists[0].name, "Fixture Artist");
+});

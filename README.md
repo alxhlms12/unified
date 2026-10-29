@@ -4,7 +4,7 @@ Unified is a provider-agnostic music REST API for Tidal, Deezer, Qobuz, YouTube 
 
 The public API contract is Unified's own generic `/v1/*` design. The `binimum/hifi-api` route shapes are implemented **only for Tidal compatibility**, and they are kept in a separate router. The other providers do not inherit Tidal's endpoint naming or response structure.
 
-> **Implementation status:** this is a foundation with adapters and route coverage, not yet verified full feature parity or end-to-end playback on every provider. Upstream private interfaces can change. Run the tests locally and verify provider calls using credentials for your own instance before exposing it publicly.
+> **Implementation status:** provider coverage is still uneven, and upstream private interfaces can change. The 0.2.1 maintenance update fixes the Tidal adapter's generic method interface, switches Deezer's ARL-to-JWT handshake to POST, and uses Tidal's native ISRC filter. SoundCloud ISRC matching is best-effort because its search endpoint has no dedicated ISRC filter. Run the tests locally and verify provider calls using credentials for your own instance before exposing it publicly.
 
 ## Install and run
 
@@ -84,7 +84,7 @@ These routes use Unified's generic naming and normalized schema regardless of th
 | `GET /v1/providers` | Configured status and capabilities for all five providers; never returns credential values |
 | `GET /v1/search?q=...&type=track` | Search all providers by default |
 | `GET /v1/search?q=...&type=album&provider=qobuz` | Search a specific provider and resource type |
-| `GET /v1/match?isrc=...` | Look for exact ISRC matches across provider catalogs |
+| `GET /v1/match?isrc=...` | Look for exact ISRC matches across provider catalogs; response includes per-provider check details |
 | `GET /v1/tracks/{id}` | Track metadata |
 | `GET /v1/tracks/{id}/stream` | Provider-supported playback/manifest resolution |
 | `GET /v1/tracks/{id}/lyrics` | Lyrics, when supported |
@@ -136,11 +136,11 @@ The following root-level paths intentionally follow the route naming and paramet
 
 ## Provider-specific limitations
 
-- **Tidal:** refreshes access tokens server-side. The compatibility routes expose track playback information and v2 track manifest metadata. Actual playback availability and audio quality depend on the account and upstream response.
-- **Deezer:** uses the internal Pipe GraphQL route with the configured `d-arl` session value. Stream output is entitlement/media metadata; protected audio is not decrypted or reconstructed.
+- **Tidal:** refreshes access tokens server-side. Generic routes use the same `info`, `album`, `artist`, `playlist`, `lyrics`, and `stream` adapter interface as other providers. ISRC matching uses Tidal's native `GET /v1/tracks?isrc=...` filter. Album and playlist reads include a track list when the upstream items endpoint succeeds. The compatibility routes expose track playback information and v2 track manifest metadata. Actual playback availability and audio quality depend on the account and upstream response.
+- **Deezer:** uses the internal Pipe GraphQL route with the configured `d-arl` session value. The ARL-to-JWT handshake uses `POST` to `auth.deezer.com/login/arl`; a 405 at this step is treated as a regression. Stream output is entitlement/media metadata; protected audio is not decrypted or reconstructed.
 - **Qobuz:** catalog calls use the JSON API path family. The legacy `track/getFileUrl` method may return HTTP 410; the current encrypted web-player flow is not implemented in this foundation.
 - **YouTube Music:** uses internal Innertube search/player/browse calls. API-key discovery is attempted from the served frontend when `ytm-api-key` is absent. Encrypted signature URLs are not deciphered.
-- **SoundCloud:** uses API-v2 and track transcodings. `sc-cid` overrides best-effort client ID discovery from current frontend bundles; discovery results are cached per Worker isolate and may expire.
+- **SoundCloud:** uses the internal API-v2 and track transcodings. `sc-cid` overrides best-effort client ID discovery from current frontend bundles; discovery results are cached per Worker isolate and may expire. ISRC matching submits the ISRC to the search text index and verifies candidate metadata, but this is not exhaustive because SoundCloud has no dedicated ISRC search filter.
 
 These private interfaces can change without notice. A configured provider is not necessarily reachable, and a returned metadata object does not guarantee that an audio stream is playable.
 
@@ -152,3 +152,13 @@ npm test
 ```
 
 Tests exercise Hono routing, error handling, API-key enforcement, generic routes, and Tidal compatibility dispatch. They do not prove that live upstream services accept a particular credential or route.
+
+## 0.2.1 maintenance fixes
+
+- Added Tidal adapter aliases expected by the generic REST router (`album`, `artist`, `playlist`, `lyrics`, and `stream`).
+- Tidal album and playlist resources include their item lists when upstream requests succeed; item-list failures are returned as `tracksError` instead of discarding otherwise valid metadata.
+- Added native Tidal ISRC lookup and per-provider diagnostics in `/v1/match` (`checkedProviders`, strategy, candidate count, match count, and failures).
+- SoundCloud ISRC matching now queries the internal text search and fetches candidate track metadata before exact-comparing the ISRC. SoundCloud's own search limitation remains.
+- Fixed Deezer's ARL-to-JWT authentication request from GET to POST, the source of the reported HTTP 405.
+- Fixed SoundCloud duration normalization (source values are milliseconds) and Tidal UUID artwork URL construction.
+- Added mocked regression tests for these behaviors. The tests use fake upstream responses and do not require live provider accounts.
