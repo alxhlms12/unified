@@ -1,0 +1,13 @@
+{
+  "name": "unified-music-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/lib.js && node --check src/providers/tidal.js && node --check src/providers/deezer.js && node --check src/providers/qobuz.js && node --check src/providers/ytmusic.js && node --check src/providers/soundcloud.js"
+  },
+  "devDependencies": { "wrangler": "^4.20.0" }
+}

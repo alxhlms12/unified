@@ -1,0 +1,9 @@
+name = "unified-music-api"
+main = "src/index.js"
+compatibility_date = "2026-10-29"
+workers_dev = true
+
+[vars]
+UNIFIED_VERSION = "0.1.0"
+DEFAULT_COUNTRY = "US"
+SOUNDCLOUD_DISCOVERY = "true"
