@@ -1,4 +1,4 @@
-export const API_VERSION = "0.1.0";
+export const API_VERSION = "0.2.0";
 export const TIDAL_COMPAT_VERSION = "2.10";
 
 export class ApiError extends Error {
