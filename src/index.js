@@ -30,7 +30,8 @@ app.use("*", async (c, next) => {
   const path = c.req.path;
   const publicPaths = new Set(["/", "/openapi.json", "/v1/health"]);
   const configuredKey = c.env.UNIFIED_API_KEY;
-  if (configuredKey && !publicPaths.has(path)) {
+  const signedMediaRelay = path.startsWith("/v1/relay/deezer/");
+  if (configuredKey && !publicPaths.has(path) && !signedMediaRelay) {
     const supplied = c.req.header("x-api-key") || c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
     if (supplied !== configuredKey) throw new ApiError(401, "unauthorized", "Provide a valid Unified API key.");
   }

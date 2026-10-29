@@ -3,6 +3,7 @@ import { ApiError, fetchJson, fetchText, providerStatus, normalizeTrack } from "
 const HOME = "https://music.youtube.com/";
 const API = "https://music.youtube.com/youtubei/v1/";
 let runtimeCache = { at: 0, apiKey: null, clientVersion: null, visitorData: null };
+let discoveryFlight = null;
 
 async function discover(env) {
   if (env["ytm-api-key"]) return {
@@ -11,17 +12,21 @@ async function discover(env) {
     visitorData: env["ytm-visitor-data"] || null
   };
   if (runtimeCache.apiKey && runtimeCache.at > Date.now() - 6 * 60 * 60 * 1000) return runtimeCache;
-  const { text } = await fetchText(HOME, { headers: { "user-agent": "Mozilla/5.0", accept: "text/html" } });
-  const apiKey = /"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/.exec(text)?.[1]
-    ?? /"innertubeApiKey"\s*:\s*"([^"]+)"/.exec(text)?.[1];
-  const clientVersion = /"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/.exec(text)?.[1]
-    ?? env["ytm-client-version"] ?? "1.20261028.03.00";
-  const visitorData = /"VISITOR_DATA"\s*:\s*"([^"]+)"/.exec(text)?.[1] ?? env["ytm-visitor-data"] ?? null;
-  if (!apiKey) throw new ApiError(503, "ytm_key_discovery_failed", "YouTube Music API-key discovery failed; configure ytm-api-key.");
-  runtimeCache = { at: Date.now(), apiKey, clientVersion, visitorData };
-  return runtimeCache;
+  if (discoveryFlight) return discoveryFlight;
+  discoveryFlight = (async () => {
+    const { text } = await fetchText(HOME, { headers: { "user-agent": "Mozilla/5.0", accept: "text/html" } }, 7000);
+    const apiKey = /"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/.exec(text)?.[1]
+      ?? /"innertubeApiKey"\s*:\s*"([^"]+)"/.exec(text)?.[1];
+    const clientVersion = /"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/.exec(text)?.[1]
+      ?? env["ytm-client-version"] ?? "1.20261028.03.00";
+    const visitorData = /"VISITOR_DATA"\s*:\s*"([^"]+)"/.exec(text)?.[1] ?? env["ytm-visitor-data"] ?? null;
+    if (!apiKey) throw new ApiError(503, "ytm_key_discovery_failed", "YouTube Music API-key discovery failed; configure ytm-api-key.");
+    runtimeCache = { at: Date.now(), apiKey, clientVersion, visitorData };
+    return runtimeCache;
+  })();
+  try { return await discoveryFlight; }
+  finally { discoveryFlight = null; }
 }
-
 function context(env, config) {
   return {
     client: {
@@ -34,13 +39,36 @@ function context(env, config) {
   };
 }
 
+function cookieValue(cookie, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|;\\s*)${escaped}=([^;]+)`).exec(cookie)?.[1] ?? null;
+}
+
+async function cookieAuthorization(cookie, origin) {
+  if (!cookie) return null;
+  // YouTube's authenticated web client can require SAPISIDHASH in addition to
+  // the Cookie header. This is derived from the operator's configured cookie;
+  // no credential is returned by the REST API.
+  const sapisid = cookieValue(cookie, "SAPISID") ?? cookieValue(cookie, "__Secure-3PAPISID") ?? cookieValue(cookie, "__Secure-1PAPISID");
+  if (!sapisid) return null;
+  const timestamp = Math.floor(Date.now() / 1000);
+  const digest = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(`${timestamp} ${sapisid} ${origin}`));
+  const hex = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  return `SAPISIDHASH ${timestamp}_${hex}`;
+}
+
 async function call(env, method, body) {
   const config = await discover(env);
   const url = new URL(method, API);
   url.searchParams.set("key", config.apiKey);
   url.searchParams.set("prettyPrint", "false");
-  const headers = { "content-type": "application/json", "user-agent": "Mozilla/5.0", origin: "https://music.youtube.com" };
-  if (env["ytm-cookie"]) headers.cookie = env["ytm-cookie"];
+  const origin = "https://music.youtube.com";
+  const headers = { "content-type": "application/json", "user-agent": "Mozilla/5.0", origin, "x-origin": origin };
+  if (env["ytm-cookie"]) {
+    headers.cookie = env["ytm-cookie"];
+    const authorization = await cookieAuthorization(env["ytm-cookie"], origin);
+    if (authorization) headers.authorization = authorization;
+  }
   return fetchJson(url, { method: "POST", headers, body: JSON.stringify({ context: context(env, config), ...body }) });
 }
 
@@ -99,7 +127,7 @@ export function status(env) {
   return providerStatus(env, "youtube-music", [], {
     search: true, songMetadata: true, albumMetadata: true, artistMetadata: true, playlistMetadata: true,
     streamInfo: true
-  }, { configured: Boolean(env["ytm-api-key"]), available: configured, availableWithoutRequired: configured, capabilities: { autoDiscoverApiKey: !env["ytm-api-key"], cookieAuthentication: Boolean(env["ytm-cookie"]) } });
+  }, { configured: Boolean(env["ytm-api-key"]), available: configured, availableWithoutRequired: configured, capabilities: { autoDiscoverApiKey: !env["ytm-api-key"], cookieAuthentication: Boolean(env["ytm-cookie"]), sapisidHashAuth: Boolean(env["ytm-cookie"] && /(?:^|;\s*)(?:SAPISID|__Secure-3PAPISID|__Secure-1PAPISID)=/.test(env["ytm-cookie"])) } });
 }
 
 export async function search(env, query, type = "track", limit = 25, offset = 0) {
@@ -123,17 +151,20 @@ export async function lyrics(env, id) {
   const response = await fetchText(caption.baseUrl, { headers: { "user-agent": "Mozilla/5.0" } });
   return { trackId: id, format: caption.kind || "captions", data: response.text };
 }
-export async function stream(env, id) {
+export async function stream(env, id, options = {}) {
   const result = await info(env, id);
   const formats = result?.streamingData?.adaptiveFormats ?? result?.streamingData?.formats ?? [];
   const direct = formats.filter(format => format.url).map(format => ({
     url: format.url, mimeType: format.mimeType ?? null, bitrate: format.bitrate ?? null,
     audioQuality: format.audioQuality ?? null, contentLength: format.contentLength ?? null
   }));
+  const best = direct.find(format => format.mimeType?.startsWith("audio/")) ?? direct[0] ?? null;
   return {
-    provider: "youtube-music", trackId: id, playable: direct.length > 0,
-    formats: direct,
+    provider: "youtube-music", trackId: String(id), url: best?.url ?? null,
+    streamType: "direct", mimeType: best?.mimeType ?? null, codec: best?.mimeType?.split(";")[0]?.split("/")[1] ?? null,
+    quality: best?.audioQuality ?? options.quality ?? null, bitrate: best?.bitrate ?? null,
+    playable: direct.length > 0, formats: direct,
     encryptedOrSignedFormatsAvailable: formats.some(format => Boolean(format.signatureCipher || format.cipher)),
-    note: direct.length ? null : "No direct URL was exposed. This adapter does not decipher protected signatureCipher URLs."
+    note: direct.length ? null : "YouTube Music did not expose a direct URL. Cookie-backed requests are supported with ytm-cookie; deciphering protected signatureCipher URLs is not implemented."
   };
 }

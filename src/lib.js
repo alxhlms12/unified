@@ -1,4 +1,4 @@
-export const API_VERSION = "0.2.1";
+export const API_VERSION = "0.3.2";
 export const TIDAL_COMPAT_VERSION = "2.10";
 
 export class ApiError extends Error {
@@ -71,7 +71,7 @@ export function providerStatus(env, name, required, capabilities, optional = {})
   };
 }
 
-export async function fetchText(url, init = {}, timeoutMs = 12000) {
+export async function fetchText(url, init = {}, timeoutMs = 7000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort("upstream timeout"), timeoutMs);
   try {
@@ -90,7 +90,7 @@ export async function fetchText(url, init = {}, timeoutMs = 12000) {
   }
 }
 
-export async function fetchJson(url, init = {}, timeoutMs = 12000) {
+export async function fetchJson(url, init = {}, timeoutMs = 7000) {
   const { text } = await fetchText(url, init, timeoutMs);
   try { return text ? JSON.parse(text) : {}; }
   catch { throw new ApiError(502, "invalid_upstream_json", "Provider returned a non-JSON response."); }
@@ -193,4 +193,110 @@ export function safeError(error) {
 export function extractEdges(connection) {
   if (Array.isArray(connection)) return connection;
   return connection?.edges?.map(edge => edge.node) ?? connection?.items ?? [];
+}
+
+
+// All provider stream resolvers return this same contract. `url` is always
+// the client-facing URL (a media URL, manifest URL, or signed Worker relay URL).
+export function normalizeStreamResult(provider, id, input = {}) {
+  let data = input && typeof input === "object" ? { ...input } : {};
+  if (provider === "tidal" && typeof data.manifest === "string") {
+    const decoded = decodeBase64Json(data.manifest);
+    const decodedUrl = decoded?.urls?.find(value => typeof value === "string" && /^https?:\/\//i.test(value));
+    if (decodedUrl) {
+      data.url = data.url ?? decodedUrl;
+      data.mimeType = data.mimeType ?? decoded.mimeType ?? decoded.mime_type ?? null;
+      data.decodedManifest = true;
+      delete data.manifest;
+    }
+  }
+
+  const rawFormats = Array.isArray(data.formats) ? data.formats : [];
+  const formats = rawFormats.map(format => ({
+    name: format?.name ?? format?.format ?? null,
+    url: format?.url ?? null,
+    mimeType: format?.mimeType ?? format?.mime_type ?? null,
+    codec: format?.codec ?? null,
+    bitrate: format?.bitrate ?? null,
+    quality: format?.quality ?? format?.audioQuality ?? null,
+    manifestType: format?.manifestType ?? null,
+    encrypted: Boolean(format?.encrypted || /(?:cbc|ctr)-encrypted-hls|widevine/i.test(format?.protocol ?? "")),
+    protocol: format?.protocol ?? null
+  }));
+  const bestFormat = formats.find(format => format.url) ?? {};
+  const url = data.url ?? data.streamUrl ?? data.manifestUrl ?? data.previewUrl ?? bestFormat.url ?? null;
+  const protocol = data.protocol ?? data.format?.protocol ?? bestFormat.protocol ?? null;
+  const mimeType = data.mimeType ?? data.mime_type ?? data.manifestMimeType ?? data.format?.mime_type ?? bestFormat.mimeType ?? null;
+  const protocolLower = String(protocol ?? "").toLowerCase();
+  const urlLower = String(url ?? "").toLowerCase();
+  let manifestType = data.manifestType ?? null;
+  if (!manifestType && (protocolLower.includes("hls") || urlLower.includes(".m3u8"))) manifestType = "HLS";
+  if (!manifestType && (urlLower.includes(".mpd") || mimeType === "application/dash+xml")) manifestType = "MPEG_DASH";
+  const encrypted = Boolean(data.encrypted || /(?:cbc|ctr)-encrypted-hls|widevine|drm-protected/i.test(protocolLower));
+  const audioMode = data.audioMode ?? (data.isAtmos || /eac3_joc|dolby[ _-]?atmos/i.test(String(data.quality ?? "")) ? "DOLBY_ATMOS" : null);
+  return {
+    schema: "unified.stream.v1",
+    provider,
+    trackId: `${provider}:track:${id}`,
+    url,
+    streamType: data.streamType ?? (data.relayed ? "relay" : manifestType ? "manifest" : "direct"),
+    manifestType,
+    mimeType,
+    codec: data.codec ?? bestFormat.codec ?? null,
+    quality: data.quality ?? data.audioQuality ?? bestFormat.quality ?? null,
+    bitDepth: data.bitDepth ?? null,
+    sampleRate: data.sampleRate ?? null,
+    bitrate: data.bitrate ?? bestFormat.bitrate ?? null,
+    audioMode,
+    isAtmos: Boolean(data.isAtmos || audioMode === "DOLBY_ATMOS"),
+    encrypted,
+    protection: data.protection ?? (encrypted ? "provider-managed" : null),
+    available: Boolean(url),
+    playable: data.playable ?? (Boolean(url) && !encrypted),
+    previewOnly: Boolean(data.previewOnly),
+    expiresAt: data.expiresAt ?? null,
+    formats,
+    ...(data.note ? { note: data.note } : {}),
+    ...(data.decodedManifest ? { decodedManifest: true } : {}),
+    ...(data.relayed ? { relayed: true } : {})
+  };
+}
+
+function decodeBase64Json(value) {
+  try {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+    const binary = atob(normalized);
+    const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch { return null; }
+}
+
+function relaySecret(env) {
+  return env.UNIFIED_RELAY_SECRET || env.UNIFIED_API_KEY || env["d-arl"] || null;
+}
+
+async function hmacHex(secret, message) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(String(secret)), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const result = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)));
+  return [...result].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export async function createRelaySignature(env, provider, id, expires) {
+  const secret = relaySecret(env);
+  if (!secret) throw new ApiError(503, "relay_not_configured", "Configure UNIFIED_RELAY_SECRET to enable signed media relay URLs.");
+  return hmacHex(secret, `${provider}:${id}:${expires}`);
+}
+
+export async function verifyRelaySignature(env, provider, id, expires, signature) {
+  if (!/^\d{10}$/.test(String(expires)) || !/^[a-f0-9]{64}$/i.test(String(signature))) return false;
+  const now = Math.floor(Date.now() / 1000);
+  const exp = Number(expires);
+  if (exp < now || exp > now + 600) return false;
+  const secret = relaySecret(env);
+  if (!secret) return false;
+  const expected = await hmacHex(secret, `${provider}:${id}:${expires}`);
+  if (expected.length !== signature.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ signature.toLowerCase().charCodeAt(i);
+  return diff === 0;
 }

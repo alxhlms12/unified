@@ -15,7 +15,7 @@ async function request(env, path, params = {}) {
     headers: {
       "x-app-id": env["q-cid"],
       "x-user-auth-token": env["q-uat"],
-      "user-agent": "UnifiedMusicAPI/0.2.1",
+      "user-agent": "UnifiedMusicAPI/0.3.2",
       accept: "application/json"
     }
   });
@@ -46,17 +46,37 @@ export async function artist(env, id) { return request(env, "artist/get", { arti
 export async function playlist(env, id) { return request(env, "playlist/get", { playlist_id: id }); }
 export async function lyrics() { throw new ApiError(501, "lyrics_unavailable", "Qobuz does not expose a consistent lyrics endpoint in this adapter."); }
 
-export async function stream(env, id, quality = "27") {
+export async function stream(env, id, qualityOrOptions = "27") {
   assertConfigured(env);
-  // Current Qobuz web playback shifted away from track/getFileUrl to session-based
-  // encrypted CMAF. The legacy endpoint has been reported as HTTP 410. We surface
-  // this explicitly instead of returning a broken URL or trying to decrypt protected media.
-  const formatId = ({ low: "5", high: "6", lossless: "6", hires: "27", "hi-res": "27" })[String(quality).toLowerCase()] ?? String(quality);
+  const options = qualityOrOptions && typeof qualityOrOptions === "object" ? qualityOrOptions : { quality: qualityOrOptions };
+  const quality = String(options.quality || "HI_RES_LOSSLESS");
+  const formatId = ({
+    low: "5", LOW: "5", high: "6", HIGH: "6", lossless: "6", LOSSLESS: "6",
+    hires: "27", "hi-res": "27", HI_RES_LOSSLESS: "27", FLAC_HIRES: "27", FLAC: "6"
+  })[quality] ?? quality;
   const url = makeUrl(API, "track/getFileUrl", {
     app_id: env["q-cid"], user_auth_token: env["q-uat"], track_id: id, format_id: formatId, intent: "stream"
   });
-  const result = await fetch(url, { headers: { "x-app-id": env["q-cid"], "x-user-auth-token": env["q-uat"], accept: "application/json" } });
-  if (result.status === 410) throw new ApiError(503, "qobuz_legacy_stream_endpoint_gone", "Qobuz's legacy file URL endpoint is gone. Current session-based encrypted playback is not implemented in this build.", { upstreamStatus: 410 });
-  if (!result.ok) throw new ApiError(502, "qobuz_stream_failed", `Qobuz stream resolution returned HTTP ${result.status}.`, { upstreamStatus: result.status });
-  return result.json();
+  let data;
+  try {
+    data = await fetchJson(url, { headers: { "x-app-id": env["q-cid"], "x-user-auth-token": env["q-uat"], accept: "application/json" } }, 5500);
+  } catch (error) {
+    if (error?.details?.upstreamStatus === 410) {
+      return {
+        provider: "qobuz", trackId: String(id), url: null,
+        streamType: "direct", manifestType: null, mimeType: null, codec: null,
+        quality, playable: false, available: false, previewOnly: false, encrypted: false,
+        note: "Qobuz's legacy file URL endpoint is gone. The session-based encrypted playback flow is not implemented in this build."
+      };
+    }
+    throw error;
+  }
+  const streamUrl = data.url ?? data.streamUrl ?? null;
+  return {
+    provider: "qobuz", trackId: String(id), url: streamUrl,
+    streamType: "direct", manifestType: null, mimeType: data.mimeType ?? null, codec: data.format ?? null,
+    quality, playable: Boolean(streamUrl), available: Boolean(streamUrl), previewOnly: false,
+    encrypted: Boolean(data.encrypted),
+    note: streamUrl ? null : "Qobuz returned no direct stream URL."
+  };
 }

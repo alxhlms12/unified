@@ -4,7 +4,7 @@ Unified is a provider-agnostic music REST API for Tidal, Deezer, Qobuz, YouTube 
 
 The public API contract is Unified's own generic `/v1/*` design. The `binimum/hifi-api` route shapes are implemented **only for Tidal compatibility**, and they are kept in a separate router. The other providers do not inherit Tidal's endpoint naming or response structure.
 
-> **Implementation status:** provider coverage is still uneven, and upstream private interfaces can change. The 0.2.1 maintenance update fixes the Tidal adapter's generic method interface, switches Deezer's ARL-to-JWT handshake to POST, and uses Tidal's native ISRC filter. SoundCloud ISRC matching is best-effort because its search endpoint has no dedicated ISRC filter. Run the tests locally and verify provider calls using credentials for your own instance before exposing it publicly.
+> **Implementation status:** provider coverage is still uneven, and upstream private interfaces can change. The 0.3.2 stream update normalizes stream responses, adds Tidal Dolby Atmos and HLS/DASH selection, improves provider timeouts/caching, and keeps protected playback paths conservative. SoundCloud ISRC matching is best-effort because its search endpoint has no dedicated ISRC filter. Run the tests locally and verify provider calls using credentials for your own instance before exposing it publicly.
 
 ## Install and run
 
@@ -71,6 +71,8 @@ Binding names below intentionally preserve the requested hyphens. In JavaScript 
 | `ytm-country` | Optional YouTube Music country code | Optional |
 | `sc-cid` | SoundCloud client ID override | Optional; frontend discovery is attempted by default |
 | `UNIFIED_API_KEY` | Protects non-public routes | Recommended for deployed instances |
+| `UNIFIED_RELAY_SECRET` | Signs short-lived Deezer preview relay links; falls back to `UNIFIED_API_KEY` or `d-arl` | Recommended |
+| `UNIFIED_PROVIDER_TIMEOUT_MS` | Optional deadline for each provider during aggregated search and ISRC matching | Optional; defaults to 6000 ms |
 
 Use `npx wrangler secret put NAME` for deployed secrets. For local development, set these in `.dev.vars`; do not commit that file.
 
@@ -86,7 +88,7 @@ These routes use Unified's generic naming and normalized schema regardless of th
 | `GET /v1/search?q=...&type=album&provider=qobuz` | Search a specific provider and resource type |
 | `GET /v1/match?isrc=...` | Look for exact ISRC matches across provider catalogs; response includes per-provider check details |
 | `GET /v1/tracks/{id}` | Track metadata |
-| `GET /v1/tracks/{id}/stream` | Provider-supported playback/manifest resolution |
+| `GET /v1/tracks/{id}/stream` | Provider-supported playback/manifest resolution, normalized into a shared stream schema |
 | `GET /v1/tracks/{id}/lyrics` | Lyrics, when supported |
 | `GET /v1/albums/{id}` | Album metadata and available track data |
 | `GET /v1/artists/{id}` | Artist metadata and supported catalog data |
@@ -111,6 +113,30 @@ Example:
 ```http
 GET /v1/search?q=Ella%20Mai&type=track&provider=all
 ```
+
+### Unified stream contract
+
+Every provider's `GET /v1/tracks/{id}/stream` response uses the same `data` fields: `url`, `streamType`, `manifestType`, `mimeType`, `codec`, `quality`, `bitDepth`, `sampleRate`, `bitrate`, `audioMode`, `isAtmos`, `encrypted`, `protection`, `available`, `playable`, `previewOnly`, `expiresAt`, and `formats`. Fields that are not known for a provider are `null` or empty; provider-specific response keys such as `manifest` are not required by clients.
+
+Tidal examples:
+
+```http
+GET /v1/tracks/tidal:track:123/stream
+GET /v1/tracks/tidal:track:123/stream?manifestType=HLS
+GET /v1/tracks/tidal:track:123/stream?manifestType=MPEG_DASH
+GET /v1/tracks/tidal:track:123/stream?atmos=true
+GET /v1/tracks/tidal:track:123/stream?audioMode=DOLBY_ATMOS&manifestType=MPEG_DASH
+```
+
+`manifestType` accepts `HLS` or `MPEG_DASH`; it defaults to `MPEG_DASH`. Atmos requests use `EAC3_JOC` and report `audioMode: "DOLBY_ATMOS"` / `isAtmos: true` only when the returned manifest indicates Atmos. The legacy-shaped Tidal `/track/?id=...` compatibility route also resolves to a direct manifest `url` instead of returning a base64 manifest payload.
+
+Deezer's adapter conservatively relays an exposed preview URL through a time-limited, signed Worker URL. This is a preview, not a full-track stream. Unified does not decrypt protected full-track Deezer media. To enable a dedicated relay signing key, set `UNIFIED_RELAY_SECRET`.
+
+SoundCloud chooses a clear transcoding when one is exposed. If the only available transcodings use `cbc-encrypted-hls` or `ctr-encrypted-hls`, the shared schema still returns the URL and HLS type but marks `encrypted: true` and `playable: false`; the adapter does not bypass those protections.
+
+### Performance and WebAssembly
+
+Search and ISRC matching fan out to providers concurrently and use short per-isolate result caches; token and client-ID discovery are coalesced so simultaneous requests do not repeat the same setup. SoundCloud client-ID discovery races frontend bundles and returns as soon as one yields an ID. Playback URLs are not cached as catalog data because they may expire. These operations are dominated by upstream network/authentication latency rather than CPU-heavy computation, so a WASM module would not speed the HTTP round trips and would add bundle/cold-start overhead; the Worker uses native fetch, Web Crypto, and typed arrays for these operations.
 
 ## Tidal-only compatibility routes
 
@@ -162,3 +188,25 @@ Tests exercise Hono routing, error handling, API-key enforcement, generic routes
 - Fixed Deezer's ARL-to-JWT authentication request from GET to POST, the source of the reported HTTP 405.
 - Fixed SoundCloud duration normalization (source values are milliseconds) and Tidal UUID artwork URL construction.
 - Added mocked regression tests for these behaviors. The tests use fake upstream responses and do not require live provider accounts.
+
+
+## 0.3.0 stream and latency updates
+
+- Unified the stream resolver output shape across providers; clients can read `data.url` and common stream metadata instead of checking for Tidal `manifest` versus SoundCloud `url`.
+- Tidal `/track/` and `/trackManifests/` now return the resolved manifest URL, with `manifestType=HLS|MPEG_DASH` and explicit Dolby Atmos selection via `atmos=true`, `quality=ATMOS`, `audioMode=DOLBY_ATMOS`, or `formats=EAC3_JOC`.
+- Deezer stream resolution returns a Worker-relayed URL only when a preview is available; relay URLs are signed and expire after five minutes.
+- SoundCloud now prefers available clear formats and reports CBC/CTR encrypted HLS as protected instead of attempting decryption.
+- YouTube Music `ytm-cookie` is sent to Innertube and used to generate `SAPISIDHASH` when an applicable SAPISID cookie is present.
+- Reduced default upstream timeouts, improved SoundCloud client-ID discovery, and cache partial search/ISRC results even when an unconfigured provider has errors.
+- Added mock regression tests for Atmos/HLS selection, decoded Tidal manifests, SoundCloud protected HLS, YouTube Music cookie authorization, and signed relay URLs.
+
+
+## 0.3.2 stream consistency and latency fixes
+
+- Tidal stream endpoints accept `manifestType=HLS|MPEG_DASH`; Dolby Atmos requests select `EAC3_JOC`, and Atmos availability is reported only when Tidal confirms that format.
+- Tidal's `/track/` compatibility route returns a direct manifest URL, not the encoded manifest payload.
+- Stream responses use the shared `unified.stream.v1` schema and `data.url` consistently. Providers that cannot return a clear stream URL return `url: null`, `available: false`, and an explanatory `note` instead of a provider-specific unsupported response.
+- Deezer continues to use Pipe GraphQL only. A clear preview URL is relayed through a short-lived signed Worker URL only if Pipe exposes an approved preview URL; the adapter does not fall back to public REST routes or decode protected full-track media.
+- SoundCloud client-ID discovery scans a smaller concurrent bundle set to reduce cold-start request amplification.
+- Qobuz's retired legacy stream resolver is bounded by a timeout and returns a normalized unavailable result on HTTP 410.
+- No WASM module was added: these routes are dominated by upstream network and authentication latency, while manifest base64 decoding and signature hashing are small native operations. WASM would add cold-start and bundle overhead without reducing upstream round trips.

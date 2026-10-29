@@ -4,9 +4,10 @@ import * as deezer from "../providers/deezer.js";
 import * as qobuz from "../providers/qobuz.js";
 import * as ytmusic from "../providers/ytmusic.js";
 import * as soundcloud from "../providers/soundcloud.js";
-import { API_VERSION, ApiError, numberParam, providerResourceId, normalizeTrack, requireParam } from "../lib.js";
+import { API_VERSION, ApiError, numberParam, providerResourceId, normalizeTrack, normalizeStreamResult, requireParam, createRelaySignature, verifyRelaySignature } from "../lib.js";
 
 const providers = { tidal, deezer, qobuz, "youtube-music": ytmusic, soundcloud };
+const resultCache = new Map();
 export const v1Routes = new Hono({ strict: false });
 
 function canonicalProvider(raw = "all") {
@@ -85,6 +86,41 @@ function collectionFromResult(result, type) {
   return [];
 }
 
+function cacheRead(key) {
+  const item = resultCache.get(key);
+  if (!item || item.expiresAt <= Date.now()) {
+    resultCache.delete(key);
+    return null;
+  }
+  return structuredClone(item.value);
+}
+function cacheWrite(key, value, ttlMs) {
+  resultCache.set(key, { value: structuredClone(value), expiresAt: Date.now() + ttlMs });
+  if (resultCache.size > 300) {
+    const oldest = resultCache.keys().next().value;
+    if (oldest) resultCache.delete(oldest);
+  }
+}
+
+function providerTimeoutMs(env) {
+  const configured = Number(env.UNIFIED_PROVIDER_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured >= 1000 && configured <= 30000 ? configured : 6000;
+}
+
+async function withProviderDeadline(provider, operation, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new ApiError(504, "provider_timeout", `${provider} exceeded the ${timeoutMs} ms provider deadline.`, { provider, timeoutMs })), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function runSearch(env, url) {
   const query = requireParam(url, "q");
   const type = url.searchParams.get("type") || "track";
@@ -94,22 +130,38 @@ async function runSearch(env, url) {
   const provider = canonicalProvider(url.searchParams.get("provider") || "all");
   const limit = numberParam(url, "limit", 25, 1, 100);
   const offset = numberParam(url, "offset", 0, 0, 1000000);
+  const cacheKey = `search:${provider}:${type}:${query.toLowerCase()}:${limit}:${offset}`;
+  const cached = cacheRead(cacheKey);
+  if (cached) return cached;
   const targets = provider === "all" ? Object.keys(providers) : [provider];
-  const settled = await Promise.allSettled(targets.map(name => providers[name].search(env, query, type, limit, offset)));
+  const timeoutMs = providerTimeoutMs(env);
+  const settled = await Promise.all(targets.map(async name => {
+    const started = Date.now();
+    try {
+      const value = await withProviderDeadline(name, () => providers[name].search(env, query, type, limit, offset), timeoutMs);
+      return { name, value, elapsedMs: Date.now() - started };
+    } catch (error) {
+      return { name, error, elapsedMs: Date.now() - started };
+    }
+  }));
   const results = [];
   const errors = [];
-  settled.forEach((entry, index) => {
-    const name = targets[index];
-    if (entry.status === "rejected") {
-      errors.push({ provider: name, code: entry.reason?.code || "provider_error", message: entry.reason?.message || "Provider request failed." });
-      return;
+  for (const entry of settled) {
+    const name = entry.name;
+    if (entry.error) {
+      errors.push({ provider: name, code: entry.error?.code || "provider_error", message: entry.error?.message || "Provider request failed.", elapsedMs: entry.elapsedMs });
+      continue;
     }
     const value = entry.value;
     const items = Array.isArray(value?.items) ? value.items : collectionFromResult(value, type);
-    results.push({ provider: name, type, total: value?.total ?? null, items: items.map(item => normalizeEntity(name, type, item)) });
-  });
+    results.push({ provider: name, type, total: value?.total ?? null, elapsedMs: entry.elapsedMs, items: items.map(item => normalizeEntity(name, type, item)) });
+  }
   const items = results.flatMap(result => result.items);
-  return { query, type, provider, count: items.length, items, results, errors, partial: errors.length > 0 };
+  const response = { query, type, provider, count: items.length, items, results, errors, partial: errors.length > 0 };
+  // Catalog entries change less often than stream URLs; this short per-isolate
+  // cache avoids repeated upstream latency while never caching playback URLs.
+  if (results.length > 0) cacheWrite(cacheKey, response, 30000);
+  return response;
 }
 
 async function matchIsrc(env, url) {
@@ -117,42 +169,53 @@ async function matchIsrc(env, url) {
   if (!/^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/.test(isrc)) {
     throw new ApiError(400, "invalid_isrc", "isrc must be a 12-character ISO 3901 recording code.");
   }
+  const cacheKey = `isrc:${isrc}`;
+  const cached = cacheRead(cacheKey);
+  if (cached) return cached;
   const targets = Object.keys(providers);
-  const settled = await Promise.allSettled(targets.map(async name => {
-    const adapter = providers[name];
-    if (typeof adapter.findByIsrc === "function") return await adapter.findByIsrc(env, isrc, 25, 0);
-    const result = await adapter.search(env, isrc, "track", 25, 0);
-    return { items: result?.items ?? [], strategy: "text_search_then_exact_isrc_check" };
+  const timeoutMs = providerTimeoutMs(env);
+  const settled = await Promise.all(targets.map(async name => {
+    const started = Date.now();
+    try {
+      const adapter = providers[name];
+      const value = await withProviderDeadline(name, () => typeof adapter.findByIsrc === "function"
+        ? adapter.findByIsrc(env, isrc, 25, 0)
+        : adapter.search(env, isrc, "track", 25, 0).then(result => ({ items: result?.items ?? [], strategy: "text_search_then_exact_isrc_check" })), timeoutMs);
+      return { name, value, elapsedMs: Date.now() - started };
+    } catch (error) {
+      return { name, error, elapsedMs: Date.now() - started };
+    }
   }));
   const matches = [];
   const errors = [];
   const checkedProviders = [];
-  settled.forEach((entry, index) => {
-    const provider = targets[index];
-    if (entry.status === "rejected") {
-      const error = { provider, code: entry.reason?.code || "provider_error", message: entry.reason?.message || "Provider request failed." };
+  for (const entry of settled) {
+    const provider = entry.name;
+    if (entry.error) {
+      const error = { provider, code: entry.error?.code || "provider_error", message: entry.error?.message || "Provider request failed." };
       errors.push(error);
-      checkedProviders.push({ provider, checked: false, candidateCount: 0, matchCount: 0, error: error.code });
-      return;
+      checkedProviders.push({ provider, checked: false, candidateCount: 0, matchCount: 0, elapsedMs: entry.elapsedMs, error: error.code });
+      continue;
     }
     const items = Array.isArray(entry.value?.items) ? entry.value.items : [];
     let matchCount = 0;
     for (const item of items) {
       const normalized = normalizeEntity(provider, "track", item);
-      if (normalized?.isrc && String(normalized.isrc).toUpperCase() === isrc) {
+      if (normalized?.isrc && String(normalized.isrc).replace(/[\s-]/g, "").toUpperCase() === isrc) {
         matches.push(normalized);
         matchCount++;
       }
     }
     checkedProviders.push({
       provider, checked: true, strategy: entry.value?.strategy || "text_search_then_exact_isrc_check",
-      candidateCount: items.length, matchCount,
+      candidateCount: items.length, matchCount, elapsedMs: entry.elapsedMs,
       ...(entry.value?.limitation ? { limitation: entry.value.limitation } : {})
     });
-  });
-  return { isrc, matches, checkedProviders, errors, partial: errors.length > 0 };
+  }
+  const response = { isrc, matches, checkedProviders, errors, partial: errors.length > 0 };
+  if (checkedProviders.some(provider => provider.checked)) cacheWrite(cacheKey, response, 60000);
+  return response;
 }
-
 function parseProviderUrl(value) {
   let url;
   try { url = new URL(value); } catch { throw new ApiError(400, "invalid_url", "url must be an absolute URL"); }
@@ -190,8 +253,30 @@ async function resource(env, id, plural, action, url) {
   const expected = ({ tracks: "track", albums: "album", artists: "artist", playlists: "playlist" })[plural];
   if (parsed.type !== expected) throw new ApiError(400, "resource_type_mismatch", `This route expects a ${expected} ID.`);
   let data;
-  if (action === "stream") data = await provider.stream(env, parsed.id, url.searchParams.get("quality") || undefined);
-  else if (action === "lyrics") data = await provider.lyrics(env, parsed.id);
+  if (action === "stream") {
+    const options = {
+      quality: url.searchParams.get("quality") || undefined,
+      manifestType: url.searchParams.get("manifestType") || "MPEG_DASH",
+      audioMode: url.searchParams.get("audioMode") || undefined,
+      atmos: url.searchParams.get("atmos") === "true",
+      formats: url.searchParams.getAll("formats"),
+      relay: url.searchParams.get("relay") !== "false"
+    };
+    const raw = await provider.stream(env, parsed.id, options);
+    data = normalizeStreamResult(parsed.provider, parsed.id, raw);
+    if (parsed.provider === "deezer" && raw?.previewUrl && options.relay) {
+      const exp = Math.floor(Date.now() / 1000) + 300;
+      const sig = await createRelaySignature(env, "deezer", parsed.id, exp);
+      const relayUrl = new URL(`/v1/relay/deezer/${encodeURIComponent(parsed.id)}`, url.origin);
+      relayUrl.searchParams.set("exp", String(exp));
+      relayUrl.searchParams.set("sig", sig);
+      data = normalizeStreamResult("deezer", parsed.id, {
+        ...raw, url: relayUrl.href, streamType: "relay", relayed: true,
+        playable: true, previewOnly: true,
+        note: "This is Deezer's available preview, relayed through this Worker. Full-track protected media is not decoded by Unified."
+      });
+    }
+  } else if (action === "lyrics") data = await provider.lyrics(env, parsed.id);
   else if (plural === "tracks") data = await provider.info(env, parsed.id);
   else if (plural === "albums") data = await provider.album(env, parsed.id);
   else if (plural === "artists") data = await provider.artist(env, parsed.id);
@@ -226,6 +311,40 @@ export function openapiDocument() {
     }
   };
 }
+
+v1Routes.get("/relay/deezer/:id", async c => {
+  const id = c.req.param("id");
+  const exp = c.req.query("exp");
+  const sig = c.req.query("sig");
+  if (!(await verifyRelaySignature(c.env, "deezer", id, exp, sig))) {
+    throw new ApiError(401, "invalid_relay_signature", "This media relay URL is invalid or expired.");
+  }
+  const source = await deezer.previewUrl(c.env, id);
+  if (!source) throw new ApiError(404, "preview_unavailable", "Deezer has no playable preview for this track.");
+  const headers = new Headers({ "user-agent": "Mozilla/5.0", accept: "audio/*,*/*;q=0.8" });
+  const range = c.req.header("range");
+  if (range) headers.set("range", range);
+  let upstream;
+  try {
+    upstream = await fetch(source, { headers, redirect: "follow" });
+  } catch {
+    throw new ApiError(502, "relay_upstream_failed", "Could not reach Deezer's preview stream.");
+  }
+  if (!upstream.ok && upstream.status !== 206) {
+    throw new ApiError(502, "relay_upstream_failed", `Deezer preview returned HTTP ${upstream.status}.`, { upstreamStatus: upstream.status });
+  }
+  const outHeaders = new Headers({
+    "cache-control": "private, max-age=30",
+    "content-type": upstream.headers.get("content-type") || "audio/mpeg",
+    "accept-ranges": upstream.headers.get("accept-ranges") || "bytes",
+    "x-content-type-options": "nosniff"
+  });
+  for (const name of ["content-length", "content-range", "etag", "last-modified"]) {
+    const value = upstream.headers.get(name);
+    if (value) outHeaders.set(name, value);
+  }
+  return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
+});
 
 v1Routes.get("/health", c => c.json({ status: "ok", version: c.env.UNIFIED_VERSION || API_VERSION, timestamp: new Date().toISOString() }));
 v1Routes.get("/providers", c => c.json({ providers: Object.values(providers).map(provider => provider.status(c.env)) }));

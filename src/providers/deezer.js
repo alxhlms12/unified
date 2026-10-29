@@ -4,6 +4,8 @@ const REQUIRED = ["d-arl"];
 const AUTH_URL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const GRAPHQL_URL = "https://pipe.deezer.com/api";
 const jwtCache = new Map();
+const jwtFlights = new Map();
+const previewCache = new Map();
 
 function splitSetCookie(headers) {
   if (typeof headers?.getSetCookie === "function") return headers.getSetCookie();
@@ -42,28 +44,31 @@ async function getJwt(env, force = false) {
   const arl = env["d-arl"];
   const current = jwtCache.get(arl);
   if (!force && current?.token && current.expiresAt > Date.now() + 30000) return current.token;
-  const { response: authResponse, text } = await fetchText(AUTH_URL, {
-    // Deezer's ARL->JWT handshake is a POST. Sending GET here is rejected
-    // with HTTP 405 before Pipe GraphQL is ever reached.
-    method: "POST",
-    headers: {
-      cookie: `arl=${arl}`,
-      origin: "https://www.deezer.com",
-      referer: "https://www.deezer.com/",
-      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-      accept: "application/json, text/plain, */*"
-    }
-  });
-  rememberCookies(arl, authResponse.headers);
-  let body;
-  try { body = JSON.parse(text); } catch { throw new ApiError(503, "deezer_auth_failed", "Deezer returned an invalid authentication response."); }
-  const token = body.jwt ?? body.token ?? body.access_token;
-  if (typeof token !== "string" || !token) throw new ApiError(503, "deezer_auth_failed", "Deezer did not return a JWT. Check d-arl.");
-  const expiresAt = parseJwtExpiry(token) || Date.now() + 330000;
-  jwtCache.set(arl, { ...(jwtCache.get(arl) ?? {}), token, expiresAt });
-  return token;
+  if (jwtFlights.has(arl)) return jwtFlights.get(arl);
+  const flight = (async () => {
+    const { response: authResponse, text } = await fetchText(AUTH_URL, {
+      method: "POST",
+      headers: {
+        cookie: `arl=${arl}`,
+        origin: "https://www.deezer.com",
+        referer: "https://www.deezer.com/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+        accept: "application/json, text/plain, */*"
+      }
+    });
+    rememberCookies(arl, authResponse.headers);
+    let body;
+    try { body = JSON.parse(text); } catch { throw new ApiError(503, "deezer_auth_failed", "Deezer returned an invalid authentication response."); }
+    const token = body.jwt ?? body.token ?? body.access_token;
+    if (typeof token !== "string" || !token) throw new ApiError(503, "deezer_auth_failed", "Deezer did not return a JWT. Check d-arl.");
+    const expiresAt = parseJwtExpiry(token) || Date.now() + 330000;
+    jwtCache.set(arl, { ...(jwtCache.get(arl) ?? {}), token, expiresAt });
+    return token;
+  })();
+  jwtFlights.set(arl, flight);
+  try { return await flight; }
+  finally { if (jwtFlights.get(arl) === flight) jwtFlights.delete(arl); }
 }
-
 async function gql(env, query, variables = {}) {
   let jwt = await getJwt(env);
   const send = async token => {
@@ -114,7 +119,7 @@ const SEARCH_QUERY = `query UnifiedSearch($query: String!, $tracksFirst: Int!, $
 export function status(env) {
   return providerStatus(env, "deezer", REQUIRED, {
     search: true, trackInfo: true, albumInfo: true, artistInfo: true, playlistInfo: true,
-    synchronizedLyrics: true, directStreamResolution: false
+    synchronizedLyrics: true, previewStreamRelay: true, fullTrackStreamResolution: false
   });
 }
 
@@ -169,21 +174,47 @@ export async function lyrics(env, id) {
   return { trackId: String(id), ...track.lyrics };
 }
 
-export async function stream(env, id) {
-  // The Pipe GraphQL API can supply entitlement and media metadata, but this
-  // implementation intentionally does not decrypt or reconstruct protected
-  // Deezer media payloads.
-  const track = await info(env, id);
+export async function previewUrl(env, id) {
+  const key = `${env["d-arl"]}:${String(id)}`;
+  const cached = previewCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.url;
+  const query = `query UnifiedTrackPreview($trackId: String!) { track(trackId: $trackId) { preview } }`;
+  let url = null;
+  try {
+    const data = await gql(env, query, { trackId: String(id) });
+    const value = data?.track?.preview;
+    const candidate = typeof value === "string" ? value : value?.url;
+    if (typeof candidate === "string" && /^https:\/\//i.test(candidate)) {
+      const parsed = new URL(candidate);
+      if (parsed.hostname === "dzcdn.net" || parsed.hostname.endsWith(".dzcdn.net") ||
+          parsed.hostname === "deezer.com" || parsed.hostname.endsWith(".deezer.com")) url = parsed.href;
+    }
+  } catch {
+    // Preview is optional. A Pipe schema change should not turn the whole
+    // generic stream endpoint into an unhandled server error.
+    url = null;
+  }
+  previewCache.set(key, { url, expiresAt: Date.now() + 5 * 60 * 1000 });
+  return url;
+}
+
+export async function stream(env, id, options = {}) {
+  const preview = await previewUrl(env, id);
+  if (preview) return {
+    provider: "deezer", trackId: String(id), url: preview, previewUrl: preview,
+    streamType: "direct", mimeType: "audio/mpeg", codec: "MP3", quality: "PREVIEW",
+    playable: true, previewOnly: true, encrypted: false,
+    note: "Deezer exposes a short preview here. Full-track media is protected and is not decoded by Unified."
+  };
+  // Keep the stream response schema stable even when this provider cannot
+  // offer an unprotected URL. The Pipe GraphQL schema in common clients exposes
+  // media tokens/rights, but not a guaranteed clear preview URL; never fall
+  // back to the public REST API or try to reconstruct protected full-track data.
   return {
-    provider: "deezer",
-    trackId: String(id),
-    playable: Boolean(track.media?.rights?.sub?.available || track.media?.rights?.ads?.available),
-    media: {
-      version: track.media?.version ?? null,
-      estimatedSizes: track.media?.estimatedSizes ?? null,
-      rights: track.media?.rights ?? null
-    },
-    streamUrl: null,
-    note: "A direct stream URL is not exposed by this adapter."
+    provider: "deezer", trackId: String(id), url: null,
+    streamType: "direct", manifestType: null, mimeType: null, codec: null,
+    quality: null, playable: false, available: false, previewOnly: false,
+    encrypted: false, protection: null,
+    note: "Deezer Pipe GraphQL did not expose a clear preview URL for this track. Full-track media is protected and is not decoded by Unified."
   };
 }
